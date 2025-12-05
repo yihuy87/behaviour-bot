@@ -1,0 +1,247 @@
+# binance/binance_stream.py
+# WebSocket scanner Binance Futures 5m + Behaviour analyzer.
+
+import asyncio
+import json
+import time
+from typing import List
+
+import requests
+import websockets
+
+from config import BINANCE_STREAM_URL, BINANCE_REST_URL, REFRESH_PAIR_INTERVAL_HOURS
+from binance.binance_pairs import get_usdt_pairs
+from binance.ohlc_buffer import OHLCBufferManager
+from core.bot_state import (
+    state,
+    load_subscribers,
+    load_vip_users,
+    cleanup_expired_vip,
+    load_bot_state,
+)
+from behaviour.analyzer import analyze_symbol_behaviour
+from telegram.telegram_broadcast import broadcast_signal
+
+# jumlah candle maksimum yang disimpan per symbol
+MAX_5M_CANDLES = 120
+# berapa candle 5m yang di-preload dari REST saat start / refresh pairs
+PRELOAD_LIMIT_5M = 60
+
+# Batas preload REST /klines paralel (boleh dibesarkan kalau koneksi kuat)
+MAX_PRELOAD_CONCURRENCY = 20
+
+
+def _fetch_klines(symbol: str, interval: str, limit: int) -> list:
+    """
+    Fetch klines via REST (dipanggil di thread lewat asyncio.to_thread).
+    """
+    url = f"{BINANCE_REST_URL}/fapi/v1/klines"
+    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    return r.json()
+
+
+async def _analyze_and_broadcast(symbol: str, candles, now_ts: float):
+    """
+    Worker untuk:
+    - analisa Behaviour (sync, dijalankan di thread via asyncio.to_thread)
+    - jika ada sinyal: kirim Telegram (juga di thread)
+    - update cooldown dan log.
+
+    Tidak membatasi concurrency di level fungsi ini: semua diatur oleh event loop.
+    """
+    try:
+        # analisa behaviour di thread terpisah
+        result = await asyncio.to_thread(analyze_symbol_behaviour, symbol, candles)
+    except Exception as e:
+        print(f"[{symbol}] ERROR analyze_symbol_behaviour:", e)
+        return
+
+    if not result:
+        return
+
+    text = result["message"]
+
+    try:
+        # kirim Telegram di thread terpisah
+        await asyncio.to_thread(broadcast_signal, text)
+    except Exception as e:
+        print(f"[{symbol}] ERROR broadcast_signal:", e)
+
+    # update cooldown timestamp
+    state.last_signal_time[symbol] = now_ts
+
+    print(
+        f"[{symbol}] BEHAVIOUR SIGNAL TERKIRIM — "
+        f"Tier {result['tier']} (Score {result['score']}) "
+        f"Entry {result['entry']:.6f} SL {result['sl']:.6f}"
+    )
+
+
+async def run_behaviour_bot():
+    """
+    Loop utama behaviour bot:
+    - load state & subscribers/VIP
+    - refresh daftar pair berkala
+    - preload history 5m via REST (paralel)
+    - sambung WebSocket & update OHLCBuffer
+    - analisa + kirim sinyal di task terpisah
+    """
+    # Load state persistent
+    state.subscribers = load_subscribers()
+    state.vip_users = load_vip_users()
+    state.daily_date = time.strftime("%Y-%m-%d")
+    cleanup_expired_vip()
+    load_bot_state()
+
+    print(f"Loaded {len(state.subscribers)} subscribers, {len(state.vip_users)} VIP users.")
+
+    symbols: List[str] = []
+    last_pairs_refresh: float = 0.0
+    refresh_interval = REFRESH_PAIR_INTERVAL_HOURS * 3600
+
+    ohlc_mgr = OHLCBufferManager(max_candles=MAX_5M_CANDLES)
+
+    while state.running:
+        try:
+            now = time.time()
+            need_refresh_pairs = (
+                not symbols
+                or (now - last_pairs_refresh) > refresh_interval
+                or state.force_pairs_refresh
+            )
+
+            if need_refresh_pairs:
+                print("Refresh daftar pair USDT perpetual berdasarkan volume...")
+                symbols = get_usdt_pairs(state.max_pairs, state.min_volume_usdt)
+                last_pairs_refresh = now
+                state.force_pairs_refresh = False
+                print(f"Scan {len(symbols)} pair:", ", ".join(s.upper() for s in symbols))
+
+                # ============================
+                # PRELOAD HISTORY 5M (PARALEL)
+                # ============================
+                print(
+                    f"Mulai preload history 5m untuk {len(symbols)} symbol "
+                    f"(limit={PRELOAD_LIMIT_5M}, concurrency={MAX_PRELOAD_CONCURRENCY})..."
+                )
+
+                sem_preload = asyncio.Semaphore(MAX_PRELOAD_CONCURRENCY)
+
+                async def _preload_one(sym: str):
+                    # sym: lowercase symbol (sesuai dengan yang dipakai WS & OHLCBufferManager)
+                    async with sem_preload:
+                        try:
+                            kl = await asyncio.to_thread(
+                                _fetch_klines, sym, "5m", PRELOAD_LIMIT_5M
+                            )
+                            if not kl:
+                                print(f"[PRELOAD] {sym} — klines kosong")
+                                return
+                            ohlc_mgr.preload_candles(sym, kl)
+                        except Exception as e:
+                            print(f"[PRELOAD ERROR] {sym}: {e}")
+
+                await asyncio.gather(*(_preload_one(sym) for sym in symbols))
+
+                print("Preload selesai.")
+
+            if not symbols:
+                print("Tidak ada symbol untuk discan. Tidur sebentar...")
+                await asyncio.sleep(5)
+                continue
+
+            streams = "/".join(f"{s}@kline_5m" for s in symbols)
+            ws_url = f"{BINANCE_STREAM_URL}?streams={streams}"
+
+            print(f"Menghubungkan ke WebSocket: {ws_url}")
+            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20) as ws:
+                print("WebSocket terhubung.")
+                if state.scanning:
+                    print("Scan sebelumnya AKTIF → melanjutkan scan otomatis.")
+                else:
+                    print("Bot dalam mode STANDBY. Gunakan /startscan untuk mulai scan.\n")
+
+                while state.running:
+                    # soft restart dari Telegram
+                    if state.request_soft_restart:
+                        print("Soft restart diminta → putus WS & refresh engine...")
+                        state.request_soft_restart = False
+                        break
+
+                    # refresh daftar pair tiap interval
+                    if time.time() - last_pairs_refresh > refresh_interval:
+                        print("Interval refresh pair tercapai → refresh daftar pair & reconnect WebSocket...")
+                        break
+
+                    try:
+                        msg = await asyncio.wait_for(ws.recv(), timeout=60)
+                    except asyncio.TimeoutError:
+                        if state.debug:
+                            print("Timeout menunggu data WebSocket, lanjut...")
+                        continue
+
+                    try:
+                        data = json.loads(msg)
+                    except json.JSONDecodeError:
+                        if state.debug:
+                            print("Gagal decode JSON dari WebSocket.")
+                        continue
+
+                    kline = data.get("data", {}).get("k")
+                    if not kline:
+                        continue
+
+                    symbol = data.get("data", {}).get("s", "").lower()
+                    if not symbol:
+                        continue
+
+                    # update buffer
+                    ohlc_mgr.update_from_kline(symbol, kline)
+                    candle_closed = bool(kline.get("x", False))
+
+                    if state.debug and candle_closed:
+                        buf_len = len(ohlc_mgr.get_candles(symbol))
+                        print(
+                            f"[{time.strftime('%H:%M:%S')}] 5m close: "
+                            f"{symbol} — total candle: {buf_len}"
+                        )
+
+                    # hanya proses kalau candle close + scanning ON
+                    if not candle_closed:
+                        continue
+                    if not state.scanning:
+                        continue
+
+                    candles = ohlc_mgr.get_candles(symbol)
+                    if len(candles) < 40:
+                        continue
+
+                    now_ts = time.time()
+
+                    # cooldown dicek DI SINI sebelum lempar task
+                    if state.cooldown_seconds > 0:
+                        last_ts = state.last_signal_time.get(symbol)
+                        if last_ts and now_ts - last_ts < state.cooldown_seconds:
+                            if state.debug:
+                                print(
+                                    f"[{symbol}] Skip cooldown "
+                                    f"({int(now_ts - last_ts)}s/{state.cooldown_seconds}s)"
+                                )
+                            continue
+
+                    # analisa & kirim sinyal dijalankan sebagai task terpisah
+                    asyncio.create_task(
+                        _analyze_and_broadcast(symbol, list(candles), now_ts)
+                    )
+
+        except websockets.ConnectionClosed:
+            print("WebSocket terputus. Reconnect dalam 5 detik...")
+            await asyncio.sleep(5)
+        except Exception as e:
+            print("Error di run_behaviour_bot (luar):", e)
+            print("Coba reconnect dalam 5 detik...")
+            await asyncio.sleep(5)
+
+    print("run_behaviour_bot selesai karena state.running = False")

@@ -36,14 +36,25 @@ class BehaviourSettings:
     # --- Global scoring / filtering ---
     min_score_to_send: float = 70.0       # minimal opportunity_score kirim sinyal
     a_plus_score: float = 85.0            # batas A+ (opsional dipakai tier)
-    max_sl_pct: float = 1.0               # batas atas SL% supaya sinyal masih masuk akal
-    min_sl_pct: float = 0.10              # batas bawah SL% (jangan absurd terlalu kecil)
 
     # --- RR minimal (global) ---
     min_rr_tp2: float = 1.6               # minimal RR untuk TP2
 
+    # --- Noise / volatility floor untuk SL (murni behaviour) ---
+    # berapa candle terakhir yang dipakai untuk hitung wick & range lokal
+    noise_lookback: int = 15
+    # seberapa besar noise floor dari rata-rata wick
+    noise_wick_factor: float = 0.4
+    # seberapa besar noise floor dari rata-rata range
+    noise_range_factor: float = 0.2
+
+    # --- Batas risk maksimum relatif terhadap volatilitas lokal (behaviour-based) ---
+    # misal: risk_max = max_risk_factor * avg_range_local
+    # kalau SL terlalu jauh dari struktur (risk >> volatilitas normal), ditarik mendekat.
+    max_risk_factor: float = 3.0
+
     # --- Leverage rekomendasi (berdasarkan SL%) ---
-    # (mirip gaya IMB/SMC tapi behaviour-based)
+    # mapping output saja, tidak mempengaruhi SL-nya sendiri
     def leverage_range_for_sl(self, sl_pct: float) -> tuple[float, float]:
         if sl_pct <= 0:
             return 5.0, 10.0
@@ -53,7 +64,7 @@ class BehaviourSettings:
             return 15.0, 25.0
         if sl_pct <= 0.70:
             return 8.0, 15.0
-        if sl_pct <= 1.20:
+        if sl_pct <= 1.50:
             return 5.0, 8.0
         return 3.0, 5.0
 

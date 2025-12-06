@@ -30,41 +30,78 @@ def _dynamic_rr_factors(score: float) -> Tuple[float, float, float]:
     return rr1, rr2, rr3
 
 
-def _adjust_sl_to_bounds(side: Side, entry: float, sl_raw: float) -> Tuple[float, float]:
+def _compute_noise_floor(candles_5m: List[Candle], features: Dict[str, object]) -> Tuple[float, float]:
     """
-    Sesuaikan SL supaya SL% tidak terlalu kecil/terlalu besar:
-    - min_sl_pct <= SL% <= max_sl_pct
+    Hitung:
+    - noise_floor_abs: lantai minimal risk (Entry–SL) berbasis wick & range lokal
+    - avg_range_local: rata-rata range lokal (untuk batas risk maksimum)
+
+    Ini untuk mencegah SL terlalu dekat dengan noise wajar,
+    terutama pada pair yang cenderung wicky / chop.
     """
-    if entry <= 0:
-        return sl_raw, 0.0
+    n = len(candles_5m)
+    if n == 0:
+        return 0.0, 0.0
 
-    risk = abs(entry - sl_raw)
-    sl_pct = (risk / entry) * 100.0 if entry != 0 else 0.0
+    lookback = behaviour_settings.noise_lookback
+    start = max(0, n - lookback)
+    segment = candles_5m[start:]
 
-    min_sl = behaviour_settings.min_sl_pct
-    max_sl = behaviour_settings.max_sl_pct
+    if not segment:
+        return 0.0, 0.0
 
-    # terlalu kecil → longgarkan SL
-    if sl_pct < min_sl:
-        risk_target = entry * min_sl / 100.0
-        if side == "long":
-            sl = entry - risk_target
-        else:
-            sl = entry + risk_target
-        sl_pct = min_sl
-        return sl, sl_pct
+    ranges: List[float] = []
+    upper_wicks: List[float] = []
+    lower_wicks: List[float] = []
 
-    # terlalu besar → SL didekatkan ke entry
-    if sl_pct > max_sl:
-        risk_target = entry * max_sl / 100.0
-        if side == "long":
-            sl = entry - risk_target
-        else:
-            sl = entry + risk_target
-        sl_pct = max_sl
-        return sl, sl_pct
+    for c in segment:
+        high = c["high"]
+        low = c["low"]
+        open_ = c["open"]
+        close = c["close"]
 
-    return sl_raw, sl_pct
+        r = high - low
+        if r <= 0:
+            continue
+        ranges.append(r)
+
+        upper_wicks.append(high - max(open_, close))
+        lower_wicks.append(min(open_, close) - low)
+
+    if not ranges:
+        return 0.0, 0.0
+
+    avg_range_local = sum(ranges) / len(ranges)
+
+    def _avg(xs: List[float]) -> float:
+        return sum(xs) / len(xs) if xs else 0.0
+
+    avg_upper = _avg(upper_wicks)
+    avg_lower = _avg(lower_wicks)
+    avg_wick = (avg_upper + avg_lower) * 0.5
+
+    # fallback: kalau avg_range_local aneh, pakai fitur global kalau ada
+    if avg_range_local <= 0:
+        try:
+            avg_range_feat = float(features.get("avg_range", 0.0))
+        except Exception:
+            avg_range_feat = 0.0
+        if avg_range_feat > 0:
+            avg_range_local = avg_range_feat
+
+    wick_floor = behaviour_settings.noise_wick_factor * avg_wick if avg_wick > 0 else 0.0
+    range_floor = (
+        behaviour_settings.noise_range_factor * avg_range_local
+        if avg_range_local > 0
+        else 0.0
+    )
+
+    floor = max(wick_floor, range_floor)
+
+    if floor <= 0:
+        return 0.0, float(avg_range_local)
+
+    return float(floor), float(avg_range_local)
 
 
 def build_levels(
@@ -76,7 +113,9 @@ def build_levels(
     """
     Bangun Entry / SL / TP berdasarkan behaviour:
     - Entry pakai struktur candle terakhir (dan sedikit anti-FOMO)
-    - SL di luar low/high candle + buffer → disesuaikan ke min/max SL%
+    - SL di luar low/high candle + buffer struktur
+    - SL minimal sejauh 'noise floor' (berbasis wick & range lokal)
+    - SL maksimal dikontrol oleh max_risk_factor * avg_range_local (behaviour-based)
     - TP dinamis dari RR + skor peluang
     """
     last = candles_5m[-1]
@@ -87,40 +126,66 @@ def build_levels(
 
     rng = max(high - low, 1e-9)
     last_price = close
-    avg_range = float(features.get("avg_range", rng))
+    avg_range_feat = float(features.get("avg_range", rng))
 
-    # Entry:
+    # ===================== ENTRY =====================
     if side == "long":
-        # entry dekat bagian bawah tubuh/low candle
+        # entry dekat bagian bawah candle (sedikit di atas low)
         raw_entry = low + 0.25 * rng
         entry = min(raw_entry, last_price)  # jangan di atas harga sekarang
-        # SL sedikit di bawah low, awalnya gunakan 15% range + sedikit noise dari avg_range
-        base_buffer = 0.15 * rng + 0.10 * avg_range
+        # SL awal: sedikit di bawah low, gunakan 15% range + 10% avg_range sebagai buffer struktur
+        base_buffer = 0.15 * rng + 0.10 * avg_range_feat
         sl_raw = low - base_buffer
     else:
+        # short: entry dekat bagian atas candle
         raw_entry = high - 0.25 * rng
         entry = max(raw_entry, last_price)  # jangan di bawah harga sekarang
-        base_buffer = 0.15 * rng + 0.10 * avg_range
+        base_buffer = 0.15 * rng + 0.10 * avg_range_feat
         sl_raw = high + base_buffer
 
     if entry == 0:
         # fallback ekstrem (jarang terjadi)
         entry = last_price
 
-    # Sesuaikan SL agar SL% berada di [min_sl_pct, max_sl_pct]
-    sl, sl_pct = _adjust_sl_to_bounds(side, entry, sl_raw)
+    # ===================== NOISE FLOOR & VOLATILITY =====================
+    noise_floor_abs, avg_range_local = _compute_noise_floor(candles_5m, features)
+    if avg_range_local <= 0:
+        avg_range_local = avg_range_feat
 
-    # Hitung risk & RR dinamis
-    risk = abs(entry - sl)
+    # Risk awal (sebelum adjust)
+    risk = abs(entry - sl_raw)
+
+    # 1) Jika risk lebih kecil dari noise floor → SL dijauhkan
+    if noise_floor_abs > 0.0 and risk < noise_floor_abs:
+        if side == "long":
+            sl_raw = entry - noise_floor_abs
+        else:
+            sl_raw = entry + noise_floor_abs
+        risk = abs(entry - sl_raw)
+
+    # 2) Jika risk terlalu besar vs volatilitas lokal → tarik SL mendekat
+    if avg_range_local > 0 and risk > behaviour_settings.max_risk_factor * avg_range_local:
+        max_risk_allowed = behaviour_settings.max_risk_factor * avg_range_local
+        if side == "long":
+            sl_raw = entry - max_risk_allowed
+        else:
+            sl_raw = entry + max_risk_allowed
+        risk = abs(entry - sl_raw)
+
+    # ===================== FINAL SL & SL% =====================
+    sl = sl_raw
+
     if risk <= 0:
-        # fallback kecil
+        # fallback kecil kalau ada kasus ekstrem
         risk = abs(entry) * 0.003
         if side == "long":
             sl = entry - risk
         else:
             sl = entry + risk
-        sl_pct = (risk / entry) * 100.0 if entry != 0 else 0.0
 
+    sl_pct = (risk / entry) * 100.0 if entry != 0 else 0.0
+
+    # ===================== RR & TP (DINAMIS) =====================
     rr1, rr2, rr3 = _dynamic_rr_factors(float(opp.get("score", 0.0)))
 
     if side == "long":
@@ -132,7 +197,7 @@ def build_levels(
         tp2 = entry - rr2 * risk
         tp3 = entry - rr3 * risk
 
-    # rekomendasi leverage
+    # ===================== LEVERAGE (HANYA OUTPUT) =====================
     lev_min, lev_max = behaviour_settings.leverage_range_for_sl(sl_pct)
 
     return {
@@ -144,4 +209,4 @@ def build_levels(
         "sl_pct": float(sl_pct),
         "lev_min": float(lev_min),
         "lev_max": float(lev_max),
-    }
+        }

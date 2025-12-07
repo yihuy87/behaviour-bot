@@ -30,14 +30,18 @@ def _dynamic_rr_factors(score: float) -> Tuple[float, float, float]:
     return rr1, rr2, rr3
 
 
-def _compute_noise_floor(candles_5m: List[Candle], features: Dict[str, object]) -> Tuple[float, float]:
+def _compute_noise_floor(
+    candles_5m: List[Candle],
+    features: Dict[str, object],
+) -> Tuple[float, float]:
     """
     Hitung:
     - noise_floor_abs: lantai minimal risk (Entry–SL) berbasis wick & range lokal
     - avg_range_local: rata-rata range lokal (untuk batas risk maksimum)
 
-    Ini untuk mencegah SL terlalu dekat dengan noise wajar,
-    terutama pada pair yang cenderung wicky / chop.
+    Tujuannya:
+    - cegah SL terlalu dekat dengan noise wajar (terutama pair wicky)
+    - tapi tetap murni dari kelakuan harga (bukan % statis).
     """
     n = len(candles_5m)
     if n == 0:
@@ -46,7 +50,6 @@ def _compute_noise_floor(candles_5m: List[Candle], features: Dict[str, object]) 
     lookback = behaviour_settings.noise_lookback
     start = max(0, n - lookback)
     segment = candles_5m[start:]
-
     if not segment:
         return 0.0, 0.0
 
@@ -64,7 +67,6 @@ def _compute_noise_floor(candles_5m: List[Candle], features: Dict[str, object]) 
         if r <= 0:
             continue
         ranges.append(r)
-
         upper_wicks.append(high - max(open_, close))
         lower_wicks.append(min(open_, close) - low)
 
@@ -78,9 +80,9 @@ def _compute_noise_floor(candles_5m: List[Candle], features: Dict[str, object]) 
 
     avg_upper = _avg(upper_wicks)
     avg_lower = _avg(lower_wicks)
-    avg_wick = (avg_upper + avg_lower) * 0.5
+    avg_wick = 0.5 * (avg_upper + avg_lower)
 
-    # fallback: kalau avg_range_local aneh, pakai fitur global kalau ada
+    # fallback: kalau avg_range_local aneh, pakai fitur global
     if avg_range_local <= 0:
         try:
             avg_range_feat = float(features.get("avg_range", 0.0))
@@ -89,7 +91,10 @@ def _compute_noise_floor(candles_5m: List[Candle], features: Dict[str, object]) 
         if avg_range_feat > 0:
             avg_range_local = avg_range_feat
 
-    wick_floor = behaviour_settings.noise_wick_factor * avg_wick if avg_wick > 0 else 0.0
+    # lantai noise = max(dari wick, dari range)
+    wick_floor = (
+        behaviour_settings.noise_wick_factor * avg_wick if avg_wick > 0 else 0.0
+    )
     range_floor = (
         behaviour_settings.noise_range_factor * avg_range_local
         if avg_range_local > 0
@@ -112,7 +117,7 @@ def build_levels(
 ) -> Dict[str, float]:
     """
     Bangun Entry / SL / TP berdasarkan behaviour:
-    - Entry pakai struktur candle terakhir (dan sedikit anti-FOMO)
+    - Entry pakai struktur candle terakhir (anti-FOMO)
     - SL di luar low/high candle + buffer struktur
     - SL minimal sejauh 'noise floor' (berbasis wick & range lokal)
     - SL maksimal dikontrol oleh max_risk_factor * avg_range_local (behaviour-based)
@@ -133,11 +138,11 @@ def build_levels(
         # entry dekat bagian bawah candle (sedikit di atas low)
         raw_entry = low + 0.25 * rng
         entry = min(raw_entry, last_price)  # jangan di atas harga sekarang
-        # SL awal: sedikit di bawah low, gunakan 15% range + 10% avg_range sebagai buffer struktur
+        # buffer struktur: kombinasi range candle & avg_range
         base_buffer = 0.15 * rng + 0.10 * avg_range_feat
         sl_raw = low - base_buffer
     else:
-        # short: entry dekat bagian atas candle
+        # short: entry dekat bagian atas candle (sedikit di bawah high)
         raw_entry = high - 0.25 * rng
         entry = max(raw_entry, last_price)  # jangan di bawah harga sekarang
         base_buffer = 0.15 * rng + 0.10 * avg_range_feat

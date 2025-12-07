@@ -42,16 +42,16 @@ class BehaviourSettings:
 
     # --- Noise / volatility floor untuk SL (murni behaviour) ---
     # berapa candle terakhir yang dipakai untuk hitung wick & range lokal
-    noise_lookback: int = 15
-    # seberapa besar noise floor dari rata-rata wick
-    noise_wick_factor: float = 0.4
+    noise_lookback: int = 20
+    # seberapa besar noise floor dari rata-rata wick (dibesarkan supaya SL tidak “0.01%”)
+    noise_wick_factor: float = 0.9
     # seberapa besar noise floor dari rata-rata range
-    noise_range_factor: float = 0.2
+    noise_range_factor: float = 0.6
 
     # --- Batas risk maksimum relatif terhadap volatilitas lokal (behaviour-based) ---
-    # misal: risk_max = max_risk_factor * avg_range_local
+    # risk_max = max_risk_factor * avg_range_local
     # kalau SL terlalu jauh dari struktur (risk >> volatilitas normal), ditarik mendekat.
-    max_risk_factor: float = 3.0
+    max_risk_factor: float = 4.0
 
     # --- Leverage rekomendasi (berdasarkan SL%) ---
     # mapping output saja, tidak mempengaruhi SL-nya sendiri

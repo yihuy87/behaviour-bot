@@ -175,15 +175,24 @@ def analyze_symbol_behaviour(symbol: str, candles_5m: List[Candle]) -> Optional[
     approx_minutes = max_age_candles * 5
     valid_text = f"±{approx_minutes} menit" if approx_minutes > 0 else "singkat"
 
-    # Risk calculator mini
+    # Risk calculator mini (fixed)
+    # NOTE: di seluruh codebase kita menyimpan `sl_pct` sebagai *persen* (mis. 0.45 => 0.45%).
+    # Untuk perhitungan posisi agar loss = 1% dari balance:
+    #   sl_frac = sl_pct / 100.0   # convert to fraction (0.45% -> 0.0045)
+    #   pos_mult = 0.01 / sl_frac  # 1% / SL_fraction
     if sl_pct > 0:
-        pos_mult = 100.0 / sl_pct
+        sl_frac = sl_pct / 100.0
+        # guard ekstra — kalau sl_frac sangat kecil (nyaris nol), hindari div/0 dan cap
+        if sl_frac <= 0:
+            pos_mult = float("inf")
+        else:
+            pos_mult = 0.01 / sl_frac
         example_balance = 100.0
         example_pos = pos_mult * example_balance
         risk_calc = (
             f"Risk Calc (contoh risiko 1%):\n"
-            f"• SL : {sl_pct_text} → nilai posisi ≈ (1% / SL%) × balance ≈ {pos_mult:.1f}× balance\n"
-            f"• Contoh balance 100 USDT → posisi ≈ {example_pos:.0f} USDT\n"
+            f"• SL : {sl_pct_text} → nilai posisi ≈ (1% / SL%) × balance ≈ {pos_mult:.3f}× balance\n"
+            f"• Contoh balance 100 USDT → posisi ≈ {example_pos:.2f} USDT\n"
             f"(sesuaikan dengan balance & leverage kamu)"
         )
     else:
@@ -228,4 +237,4 @@ def analyze_symbol_behaviour(symbol: str, candles_5m: List[Candle]) -> Optional[
         "categories": cats,
         "features": features,
         "message": text,
-    }
+}
